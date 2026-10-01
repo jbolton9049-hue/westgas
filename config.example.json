@@ -1,0 +1,20 @@
+{
+  "knowledge_base": "天然气管理知识库",
+  "default_tool": "rule",
+  "ai_tools": {
+    "doubao": {
+      "name": "豆包",
+      "api_key": "",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "model": "doubao-1-5-pro-32k-250115",
+      "enabled": false
+    },
+    "deepseek": {
+      "name": "DeepSeek",
+      "api_key": "",
+      "base_url": "https://api.deepseek.com",
+      "model": "deepseek-chat",
+      "enabled": false
+    }
+  }
+}

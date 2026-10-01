@@ -1,0 +1,28 @@
+# Python cache and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local configuration may contain API keys
+config.json
+*.local.json
+
+# User knowledge base and generated runtime data
+天然气管理知识库/
+09_周期汇总/
+10_待审核更新/
+11_重复与冲突/
+12_失效资料/
+
+# Build artifacts
+build/
+dist/
+*.spec.bak
+
+# Local editor and OS files
+.vscode/
+.idea/
+*.log
+Thumbs.db
+desktop.ini
