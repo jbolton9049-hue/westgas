@@ -21,6 +21,7 @@ import train
 import search
 import maintenance
 import scheduled_tasks
+import backup
 from ai_tools import (
     load_config,
     save_config,
@@ -29,9 +30,10 @@ from ai_tools import (
     ATTR_LABELS,
     classification_label,
     record_rule_feedback,
+    CONFIG_PATH,
 )
 
-APP_TITLE = "天然气管理知识工具 v1.0"
+APP_TITLE = "天然气管理知识工具 v1.1"
 FONT = ("Microsoft YaHei", 12)
 FONT_SMALL = ("Microsoft YaHei", 11)
 FONT_MONO = ("Consolas", 11)
@@ -248,6 +250,17 @@ class App(tk.Tk):
         self._build_menu()
         self.resizable(False, False)
         self.deiconify()
+        self.after(250, self._first_run_setup)
+
+    def _first_run_setup(self):
+        if os.path.isfile(CONFIG_PATH):
+            return
+        messagebox.showinfo(
+            "首次运行设置",
+            "这是首次运行。请在系统设置中选择知识库目录；不配置 API Key 也可以使用本地规则版。",
+            parent=self,
+        )
+        self.open_config()
 
     def _build_menu(self):
         header = tk.Frame(self, bg=COLORS["navy"], height=122)
@@ -295,6 +308,88 @@ class App(tk.Tk):
         text.configure(state="disabled")
         tk.Button(win, text="关闭", font=FONT, command=win.destroy,
                   bg=COLORS["navy"], fg="#fff", relief="flat", pady=7).pack(pady=(0, 12))
+
+    def open_update_review(self):
+        """Visual review gate for periodic-maintenance drafts."""
+        win = _BaseWin("待审核更新", 1120, 760)
+        tk.Label(win, text="周期治理待审核更新", font=("Microsoft YaHei", 16, "bold"),
+                 bg=COLORS["bg"], fg=COLORS["navy"]).pack(pady=(12, 4))
+        tk.Label(win, text="选择草稿查看原文和生成结果；批准后仍需点击“发布已审核更新”。",
+                 font=FONT_SMALL, bg=COLORS["bg"], fg=COLORS["muted"]).pack(pady=(0, 8))
+        body = tk.Frame(win, bg=COLORS["bg"])
+        body.pack(fill="both", expand=True, padx=14)
+        left = tk.Frame(body, bg=COLORS["bg"], width=340)
+        left.pack(side="left", fill="y", padx=(0, 10))
+        right = tk.Frame(body, bg=COLORS["bg"])
+        right.pack(side="left", fill="both", expand=True)
+        box = tk.Listbox(left, selectmode="browse", exportselection=False, font=FONT,
+                         bg=COLORS["surface"], fg=COLORS["text"])
+        box.pack(fill="both", expand=True)
+        detail = scrolledtext.ScrolledText(right, font=FONT_MONO, wrap="word",
+                                           bg=COLORS["surface"], fg=COLORS["text"])
+        detail.pack(fill="both", expand=True)
+        state = {"drafts": []}
+
+        def show_current(*_):
+            detail.configure(state="normal")
+            detail.delete("1.0", "end")
+            selected = box.curselection()
+            if not selected:
+                detail.insert("end", "当前没有待审核草稿。")
+            else:
+                draft = state["drafts"][selected[0]]
+                detail.insert("end", draft["text"])
+                source = draft["meta"].get("source_path")
+                if source and os.path.isfile(source):
+                    try:
+                        source_text = proc.extract_text(source)
+                        detail.insert("end", "\n\n================ 原始资料当前文字 ================\n\n")
+                        detail.insert("end", source_text[:30000])
+                    except Exception as exc:
+                        detail.insert("end", f"\n\n原始资料读取失败：{exc}")
+            detail.configure(state="disabled")
+
+        def refresh():
+            state["drafts"] = maintenance.list_pending_drafts()
+            box.delete(0, "end")
+            for draft in state["drafts"]:
+                box.insert("end", draft["name"])
+            show_current()
+
+        def change_status(status):
+            selected = box.curselection()
+            if not selected:
+                messagebox.showwarning("提示", "请先选择一份待审核草稿。", parent=win)
+                return
+            draft = state["drafts"][selected[0]]
+            try:
+                maintenance.update_draft_status(draft["path"], status)
+                refresh()
+                win.out(f"✅ {draft['name']} 已标记为 {status}")
+            except Exception as exc:
+                messagebox.showerror("审核失败", str(exc), parent=win)
+
+        def publish():
+            try:
+                records = maintenance.publish_approved("rule")
+                win.out(f"✅ 已发布 {len(records)} 条审核通过的更新")
+                refresh()
+            except Exception as exc:
+                messagebox.showerror("发布失败", str(exc), parent=win)
+
+        box.bind("<<ListboxSelect>>", show_current)
+        controls = tk.Frame(win, bg=COLORS["bg"])
+        controls.pack(pady=10)
+        for label, status, color in [("批准", "approved", COLORS["green"]),
+                                     ("退回", "rejected", COLORS["amber"])]:
+            tk.Button(controls, text=label, font=FONT, command=lambda s=status: change_status(s),
+                      bg=color, fg="#fff", relief="flat", padx=16, pady=6).pack(side="left", padx=5)
+        tk.Button(controls, text="刷新", font=FONT, command=refresh,
+                  bg="#fff", fg=COLORS["navy"], relief="flat", padx=16, pady=6).pack(side="left", padx=5)
+        tk.Button(controls, text="发布已审核更新", font=FONT, command=publish,
+                  bg=COLORS["navy"], fg="#fff", relief="flat", padx=16, pady=6).pack(side="left", padx=5)
+        refresh()
+        win.add_log()
 
     # ---------- 1. 收集 ----------
     def open_collect(self):
@@ -1452,11 +1547,50 @@ class App(tk.Tk):
                 win.run_on_ui(lambda: show_job(message))
             win.run_async(work)
 
-        for label, kind in [("立即增量整理", "daily"), ("生成周报", "weekly"),
+        for label, kind in [("立即增量整理 / 重试失败", "daily"), ("生成周报", "weekly"),
                             ("生成月报", "monthly"), ("发布已审核更新", "publish")]:
             tk.Button(job_row, text=label, font=FONT_SMALL,
                       command=lambda value=kind: run_job(value), bg="#ffffff",
                       fg=COLORS["navy"], relief="flat", padx=8, pady=5).pack(side="left", padx=3)
+        review_row = tk.Frame(win, bg=COLORS["bg"])
+        review_row.pack(pady=3)
+        tk.Button(review_row, text="打开待审核更新", font=FONT_SMALL,
+                  command=self.open_update_review, bg="#dff0e5", fg="#1f6b3b",
+                  relief="flat", padx=10, pady=5).pack(side="left", padx=4)
+
+        def create_backup():
+            try:
+                path = backup.create_backup(proc.get_kb_path())
+                show_job(f"✅ 知识库备份已创建：{path}")
+            except Exception as exc:
+                show_job(f"❌ 备份失败：{exc}")
+
+        def restore_backup():
+            choices = backup.list_backups(proc.get_kb_path())
+            path = filedialog.askopenfilename(
+                title="选择知识库备份 ZIP",
+                initialdir=os.path.dirname(choices[0]) if choices else proc.get_kb_path(),
+                filetypes=[("知识库备份", "*.zip"), ("所有文件", "*.*")],
+                parent=win,
+            )
+            if not path:
+                return
+            if not messagebox.askyesno("确认恢复", "恢复前会自动创建当前知识库安全备份，继续吗？", parent=win):
+                return
+            try:
+                safety = backup.restore_backup(proc.get_kb_path(), path)
+                show_job(f"✅ 恢复完成，恢复前安全备份：{safety}")
+            except Exception as exc:
+                show_job(f"❌ 恢复失败：{exc}")
+
+        backup_row = tk.Frame(win, bg=COLORS["bg"])
+        backup_row.pack(pady=3)
+        tk.Button(backup_row, text="创建知识库备份", font=FONT_SMALL,
+                  command=create_backup, bg="#ffffff", fg=COLORS["navy"],
+                  relief="flat", padx=10, pady=5).pack(side="left", padx=4)
+        tk.Button(backup_row, text="恢复知识库备份", font=FONT_SMALL,
+                  command=restore_backup, bg="#ffffff", fg="#7a3434",
+                  relief="flat", padx=10, pady=5).pack(side="left", padx=4)
         schedule_row = tk.Frame(win, bg=COLORS["bg"])
         schedule_row.pack(pady=3)
 

@@ -22,6 +22,16 @@ from ai_tools import (
 SUPPORTED = {".pdf", ".txt", ".md", ".docx", ".csv", ".xlsx"}
 
 
+def _atomic_write_text(path, content):
+    """Write generated knowledge atomically so an interruption cannot leave a half file."""
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
 def _ocr_script_path():
     root = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(root, "ocr_windows.ps1")
@@ -248,8 +258,7 @@ def write_raw_processed(file_path, clean_text_content, tag_result):
         f"- **可信度**：待人工确认\n\n"
         f"---\n\n## 去噪后正文\n\n{clean_text_content}\n"
     )
-    with open(out_file, "w", encoding="utf-8") as f:
-        f.write(content)
+    _atomic_write_text(out_file, content)
     return out_file
 
 
@@ -323,8 +332,7 @@ def write_ledger(text, tag_result, src_file, analysis=None, record_id=None):
         f"## 六、处理状态\n\n- [x] 已自动分析\n- [x] 已人工复核\n- [ ] 已归档\n"
         + findings_text
     )
-    with open(out_file, "w", encoding="utf-8") as f:
-        f.write(content)
+    _atomic_write_text(out_file, content)
     return out_file
 
 
@@ -383,8 +391,7 @@ def write_solution(src_file, tag_result, analysis, record_id):
         f"## 五维措施\n\n" + "\n".join(f"{i}. {item}" for i, item in enumerate(measures, 1)) + "\n\n"
         "## 验收标准\n\n- 责任到人\n- 节点可查\n- 结果可验\n- 问题可追\n"
     )
-    with open(out_file, "w", encoding="utf-8") as f:
-        f.write(content)
+    _atomic_write_text(out_file, content)
     return out_file
 
 
@@ -413,8 +420,7 @@ def write_event_analysis(src_file, analysis, record_id, source_text=""):
         f"## 事件判断\n\n{analysis.get('issue', '待复核')}\n\n"
         f"## {action_title}\n\n" + "\n".join(f"- {item}" for item in measures) + "\n"
     )
-    with open(out_file, "w", encoding="utf-8") as f:
-        f.write(content)
+    _atomic_write_text(out_file, content)
     return out_file
 
 

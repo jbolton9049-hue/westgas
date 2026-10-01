@@ -4,6 +4,7 @@
 import os
 import re
 import datetime
+import sqlite3
 from collections import Counter
 
 from ai_tools import (
@@ -12,6 +13,7 @@ from ai_tools import (
     ATTR_LABELS,
     classification_label,
 )
+import knowledge_db
 
 
 SEARCH_FOLDERS = ["02_分类台账", "03_管理要点", "04_记忆卡片", "07_管理依据库", "08_事件分析"]
@@ -26,6 +28,10 @@ def search_knowledge(query, limit=30):
     """返回按关键词命中次数排序的 Markdown 文档。"""
     if not query or not query.strip():
         return []
+    try:
+        return knowledge_db.search(get_kb_path(), SEARCH_FOLDERS, query, limit)
+    except (OSError, sqlite3.Error, ValueError):
+        pass
     terms = _terms(query)
     results = []
     root = get_kb_path()

@@ -14,6 +14,8 @@ import search
 import train
 import maintenance
 import scheduled_tasks
+import knowledge_db
+import backup
 
 
 class PipelineTest(unittest.TestCase):
@@ -133,10 +135,11 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(settings["reminder_time"], "08:30")
         self.assertEqual(settings["reminder_frequency"], "only_due")
         card = train.generate_card("复习提醒", "何时复习？", "会遗忘", "按期复习", "今天复习")
-        self.assertFalse(train.should_show_reminder(now=datetime.datetime(2026, 9, 30, 8, 29)))
-        self.assertTrue(train.should_show_reminder(now=datetime.datetime(2026, 9, 30, 8, 30)))
-        train.mark_reminder_shown(on_date=datetime.date(2026, 9, 30))
-        self.assertFalse(train.should_show_reminder(now=datetime.datetime(2026, 9, 30, 9, 0)))
+        today = datetime.date.today()
+        self.assertFalse(train.should_show_reminder(now=datetime.datetime.combine(today, datetime.time(8, 29))))
+        self.assertTrue(train.should_show_reminder(now=datetime.datetime.combine(today, datetime.time(8, 30))))
+        train.mark_reminder_shown(on_date=today)
+        self.assertFalse(train.should_show_reminder(now=datetime.datetime.combine(today, datetime.time(9, 0))))
 
     def test_batch_continues_after_unsupported_files(self):
         with open(os.path.join(self.tmp.name, "ignore.bin"), "wb") as f:
@@ -331,6 +334,44 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(groups[0]["count"], 2)
         self.assertTrue(groups[0]["measures"])
         self.assertIn("建议措施", search.format_issue_summary(groups))
+
+    def test_sqlite_index_accelerates_markdown_search_and_is_rebuildable(self):
+        ledger_dir = os.path.join(self.tmp.name, "kb", "02_分类台账")
+        os.makedirs(ledger_dir, exist_ok=True)
+        path = os.path.join(ledger_dir, "台账_索引测试.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# 台账\n\n## 二、问题定性\n\n索引测试隐患整改责任。")
+        hits = search.search_knowledge("索引测试")
+        self.assertTrue(hits)
+        db_file = os.path.join(self.tmp.name, "kb", "00_系统说明", "知识库索引.sqlite3")
+        self.assertTrue(os.path.isfile(db_file))
+        with knowledge_db.connect(os.path.join(self.tmp.name, "kb")) as conn:
+            self.assertGreaterEqual(conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0], 1)
+
+    def test_backup_restore_round_trip(self):
+        target = os.path.join(self.tmp.name, "kb", "02_分类台账", "备份测试.md")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("原始内容")
+        archive = backup.create_backup(os.path.join(self.tmp.name, "kb"))
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("被修改内容")
+        safety = backup.restore_backup(os.path.join(self.tmp.name, "kb"), archive)
+        self.assertTrue(os.path.isfile(safety))
+        with open(target, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "原始内容")
+
+    def test_normalized_duplicate_report_and_task_audit(self):
+        raw_dir = os.path.join(self.tmp.name, "kb", "01_原始资料库")
+        os.makedirs(raw_dir, exist_ok=True)
+        with open(os.path.join(raw_dir, "相似一.md"), "w", encoding="utf-8") as f:
+            f.write("安全责任需要落实。\n")
+        with open(os.path.join(raw_dir, "相似二.md"), "w", encoding="utf-8") as f:
+            f.write("安全 责任 需要落实。")
+        report = maintenance.run_job("daily")
+        self.assertTrue(report["similar_duplicates"])
+        audit = os.path.join(self.tmp.name, "kb", "09_周期汇总", "任务运行日志.jsonl")
+        self.assertTrue(os.path.isfile(audit))
 
 
 if __name__ == "__main__":

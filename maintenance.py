@@ -2,19 +2,35 @@
 """知识库周期治理：增量扫描、周期报告、待审核草稿和发布。"""
 
 import datetime
+import difflib
 import hashlib
 import json
 import os
 import re
+import shutil
 from collections import Counter, defaultdict
 
 import process
 from ai_tools import process_by_tool
+import knowledge_db
 
 
 RAW_EXTENSIONS = set(process.SUPPORTED)
 INDEX_FILE = os.path.join("00_系统说明", "知识治理索引.json")
 UPDATE_LOG = os.path.join("09_周期汇总", "更新日志.md")
+
+
+def _safe_file_name(value):
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_.-]+", "_", str(value))[:100] or "未命名"
+
+
+def _atomic_write_text(path, content):
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
 
 
 def ensure_dirs():
@@ -42,8 +58,17 @@ def _load_index():
 
 def _save_index(index):
     index["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-    with open(_index_path(), "w", encoding="utf-8") as f:
+    target = _index_path()
+    temporary = target + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as f:
         json.dump(index, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary, target)
+    try:
+        knowledge_db.sync_governance_index(process.get_kb_path(), index)
+    except Exception as exc:
+        _append_log(f"SQLite索引同步失败：{exc}")
 
 
 def _sha256(path):
@@ -52,6 +77,58 @@ def _sha256(path):
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _normalized_sha256(path):
+    """Hash normalized text for a conservative near-duplicate signal."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in {".txt", ".md", ".csv"}:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as stream:
+            text = stream.read()
+    except OSError:
+        return ""
+    normalized = re.sub(r"\s+", "", text).casefold()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _snapshot_dir():
+    path = os.path.join(ensure_dirs(), "12_失效资料", "版本快照")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _save_version_snapshot(path, digest):
+    """Keep a copy of each observed source version for later human diffing."""
+    target = os.path.join(_snapshot_dir(), f"{os.path.basename(path)}.{digest[:12]}")
+    if not os.path.exists(target):
+        shutil.copy2(path, target)
+    return target
+
+
+def version_diff(path, old_hash, new_hash=None):
+    """Return a unified text diff between stored and current source versions."""
+    new_hash = new_hash or _sha256(path)
+    old_candidates = [
+        os.path.join(_snapshot_dir(), name)
+        for name in os.listdir(_snapshot_dir())
+        if name.startswith(os.path.basename(path) + ".") and old_hash[:12] in name
+    ]
+    if not old_candidates:
+        return "未找到旧版本快照。"
+    old_path = old_candidates[0]
+    try:
+        with open(old_path, "r", encoding="utf-8", errors="ignore") as stream:
+            old_lines = stream.readlines()
+        with open(path, "r", encoding="utf-8", errors="ignore") as stream:
+            new_lines = stream.readlines()
+    except (OSError, UnicodeDecodeError):
+        return "该文件不是可直接比较的文本格式，请人工核对版本。"
+    return "".join(difflib.unified_diff(
+        old_lines, new_lines, fromfile=f"旧版本 {old_hash[:12]}",
+        tofile=f"当前版本 {new_hash[:12]}",
+    )) or "文本内容无变化（可能是格式或元数据变化）。"
 
 
 def _source_files():
@@ -81,6 +158,7 @@ def scan_incremental():
             "name": os.path.basename(path),
             "source_id": "SRC-" + hashlib.sha256(path.encode("utf-8")).hexdigest()[:12],
             "hash": digest,
+            "normalized_hash": _normalized_sha256(path),
             "size": stat.st_size,
             "mtime": datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
             "file_date": datetime.date.fromtimestamp(stat.st_mtime).isoformat(),
@@ -108,6 +186,7 @@ def scan_incremental():
             item["review_status"] = previous.get("review_status", "pending")
             unchanged.append(item)
         current[key] = item
+        _save_version_snapshot(path, digest)
 
     removed = []
     for path, item in old.items():
@@ -120,15 +199,19 @@ def scan_incremental():
             current[path] = item
 
     by_hash = defaultdict(list)
+    by_normalized_hash = defaultdict(list)
     for item in current.values():
         if item.get("status") != "removed":
             by_hash[item.get("hash")].append(item["path"])
+            if item.get("normalized_hash"):
+                by_normalized_hash[item["normalized_hash"]].append(item["path"])
     duplicates = [paths for paths in by_hash.values() if len(paths) > 1]
+    similar_duplicates = [paths for paths in by_normalized_hash.values() if len(paths) > 1 and paths not in duplicates]
     index = {"files": current}
     _save_index(index)
     return {
         "new": new, "changed": changed, "unchanged": unchanged,
-        "removed": removed, "duplicates": duplicates,
+        "removed": removed, "duplicates": duplicates, "similar_duplicates": similar_duplicates,
     }
 
 
@@ -179,9 +262,26 @@ def _write_draft(item, prepared, analysis):
         "## 建议措施\n\n" + "\n".join(f"{i}. {value}" for i, value in enumerate(measures, 1)) + "\n\n"
         "<!-- ANALYSIS_JSON\n" + json.dumps(analysis, ensure_ascii=False) + "\nANALYSIS_JSON -->\n"
     )
-    with open(path, "w", encoding="utf-8") as f:
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as f:
         f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary, path)
     return path
+
+
+def _audit_path():
+    return os.path.join(ensure_dirs(), "09_周期汇总", "任务运行日志.jsonl")
+
+
+def _append_audit(kind, status, started_at, finished_at, details=None):
+    item = {
+        "kind": kind, "status": status, "started_at": started_at,
+        "finished_at": finished_at, "details": details or {},
+    }
+    with open(_audit_path(), "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 def _append_log(message):
@@ -222,12 +322,14 @@ def run_daily(tool_key=None):
             item["error"] = str(exc)
             index["files"][item["path"]] = item
     _save_index(index)
-    if report["duplicates"]:
+    if report["duplicates"] or report.get("similar_duplicates"):
         dup_path = os.path.join(ensure_dirs(), "11_重复与冲突", f"重复资料_{datetime.date.today().isoformat()}.md")
         with open(dup_path, "w", encoding="utf-8") as f:
             f.write("# 重复资料清单\n\n")
             for paths in report["duplicates"]:
                 f.write("## 同内容文件\n\n" + "\n".join(f"- {path}" for path in paths) + "\n\n")
+            for paths in report.get("similar_duplicates", []):
+                f.write("## 规范化文本相同（需人工确认）\n\n" + "\n".join(f"- {path}" for path in paths) + "\n\n")
     if report["removed"]:
         removed_path = os.path.join(ensure_dirs(), "12_失效资料", f"失效资料_{datetime.date.today().isoformat()}.md")
         with open(removed_path, "w", encoding="utf-8") as f:
@@ -237,9 +339,42 @@ def run_daily(tool_key=None):
         with open(conflict_path, "w", encoding="utf-8") as f:
             f.write("# 来源资料版本变更（需人工复核）\n\n")
             for item in report["changed"]:
-                f.write(f"- {item['path']}\n  - 旧哈希：{item.get('previous_hash')}\n  - 新哈希：{item['hash']}\n")
-    _append_log(f"每日增量：新增{len(report['new'])}，修改{len(report['changed'])}，草稿{len(drafts)}，删除{len(report['removed'])}，重复组{len(report['duplicates'])}")
+                diff_file = os.path.join(
+                    ensure_dirs(), "11_重复与冲突",
+                    f"差异_{_safe_file_name(item['name'])}_{item['hash'][:8]}.diff",
+                )
+                _atomic_write_text(diff_file, version_diff(item["path"], item.get("previous_hash", ""), item["hash"]))
+                f.write(f"- {item['path']}\n  - 旧哈希：{item.get('previous_hash')}\n  - 新哈希：{item['hash']}\n  - 文字差异：{diff_file}\n")
+    _append_log(f"每日增量：新增{len(report['new'])}，修改{len(report['changed'])}，草稿{len(drafts)}，删除{len(report['removed'])}，重复组{len(report['duplicates'])}，相似组{len(report.get('similar_duplicates', []))}")
     return {**report, "drafts": drafts}
+
+
+def list_pending_drafts():
+    """Return pending update drafts for the GUI reviewer."""
+    root = os.path.join(ensure_dirs(), "10_待审核更新")
+    drafts = []
+    for name in sorted(os.listdir(root)):
+        if not name.endswith(".md"):
+            continue
+        path = os.path.join(root, name)
+        try:
+            meta, text = _read_front_matter(path)
+        except OSError:
+            continue
+        if meta.get("review_status") == "pending":
+            drafts.append({"path": path, "name": name, "meta": meta, "text": text})
+    return drafts
+
+
+def update_draft_status(path, status):
+    if status not in {"pending", "approved", "rejected"}:
+        raise ValueError("草稿状态必须是 pending、approved 或 rejected")
+    meta, text = _read_front_matter(path)
+    if not meta:
+        raise ValueError("草稿缺少有效 front matter")
+    _set_review_status(text, path, status, meta.get("source_path"))
+    _append_log(f"人工审核草稿：{os.path.basename(path)} -> {status}")
+    return path
 
 
 def _markdown_files(folders):
@@ -466,10 +601,21 @@ def _set_review_status(text, path, status, source=None):
 
 
 def run_job(kind):
-    if kind == "daily":
-        return run_daily()
-    if kind in {"weekly", "monthly"}:
-        return generate_period_report(kind)
-    if kind == "publish":
-        return publish_approved()
-    raise ValueError(f"未知治理任务: {kind}")
+    started = datetime.datetime.now().isoformat(timespec="seconds")
+    try:
+        if kind == "daily":
+            result = run_daily()
+        elif kind in {"weekly", "monthly"}:
+            result = generate_period_report(kind)
+        elif kind == "publish":
+            result = publish_approved()
+        else:
+            raise ValueError(f"未知治理任务: {kind}")
+        finished = datetime.datetime.now().isoformat(timespec="seconds")
+        summary = {key: len(value) for key, value in result.items() if isinstance(value, list)} if isinstance(result, dict) else {"result": str(result)}
+        _append_audit(kind, "success", started, finished, summary)
+        return result
+    except Exception as exc:
+        finished = datetime.datetime.now().isoformat(timespec="seconds")
+        _append_audit(kind, "failed", started, finished, {"error": str(exc)})
+        raise
