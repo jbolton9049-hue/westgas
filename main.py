@@ -58,6 +58,10 @@ COLORS = {
     "red": "#b83232",
 }
 
+# Deliberately not equal to either decision value. Tkinter then renders both
+# radio buttons clear until the reviewer explicitly chooses one.
+REVIEW_UNSELECTED = "__unselected__"
+
 
 def configure_theme(root):
     """统一桌面控件的字体、间距和工业管理色板。"""
@@ -791,7 +795,7 @@ class App(tk.Tk):
                     for finding in findings:
                         finding_states.append({
                             "data": finding,
-                            "decision": tk.StringVar(value=""),
+                            "decision": tk.StringVar(value=REVIEW_UNSELECTED),
                         })
                     approved[key] = {
                         "findings": finding_states,

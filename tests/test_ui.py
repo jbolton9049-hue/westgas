@@ -72,6 +72,13 @@ class UiWorkflowTest(unittest.TestCase):
         self.assertIn('finding_state["decision"].get() == "agree"', self.source)
         self.assertIn("未选择或不同意的条目已排除", self.source)
 
+    def test_review_decisions_start_unselected(self):
+        """审核窗口不得默认替用户同意或不同意任何问题。"""
+        self.assertIn('REVIEW_UNSELECTED = "__unselected__"', self.source)
+        self.assertIn('tk.StringVar(value=REVIEW_UNSELECTED)', self.source)
+        self.assertNotIn('tk.StringVar(value="agree")', self.source)
+        self.assertNotIn('tk.StringVar(value="disagree")', self.source)
+
     def test_review_displays_extraction_method(self):
         self.assertIn("文字来源：", self.source)
         self.assertIn("ocr_windows.ps1", (SOURCE.parent / "天然气管理工具.spec").read_text(encoding="utf-8"))
