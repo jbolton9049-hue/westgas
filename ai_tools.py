@@ -162,7 +162,13 @@ def validate_config(cfg):
         if not isinstance(value, dict):
             errors.append(f"{key} 配置必须是对象")
             continue
-        if value.get("enabled") and not (value.get("api_key") or os.environ.get(f"WESTGAS_{key.upper()}_API_KEY")):
+        stored_secret = ""
+        try:
+            from secure_store import get_secret
+            stored_secret = get_secret(str(key), os.path.join(APP_DIR, ".secrets")) or ""
+        except Exception:
+            pass
+        if value.get("enabled") and not (value.get("api_key") or os.environ.get(f"WESTGAS_{key.upper()}_API_KEY") or stored_secret):
             errors.append(f"{key} 已启用但未配置 API Key")
         if value.get("base_url") and not str(value["base_url"]).startswith(("http://", "https://")):
             errors.append(f"{key} base_url 必须使用 http 或 https")
@@ -171,7 +177,17 @@ def validate_config(cfg):
 
 def get_api_key(tool_key, tool):
     """Prefer OS environment secrets so API keys need not be stored in config.json."""
-    return os.environ.get(f"WESTGAS_{str(tool_key).upper()}_API_KEY") or str(tool.get("api_key", ""))
+    value = os.environ.get(f"WESTGAS_{str(tool_key).upper()}_API_KEY")
+    if value:
+        return value
+    try:
+        from secure_store import get_secret
+        value = get_secret(str(tool_key), os.path.join(APP_DIR, ".secrets"))
+        if value:
+            return value
+    except Exception:
+        pass
+    return str(tool.get("api_key", ""))
 
 
 def mask_secret(value):

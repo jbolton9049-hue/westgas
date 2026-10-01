@@ -5,6 +5,8 @@ import os
 import re
 import datetime
 import sqlite3
+import hashlib
+import json
 from collections import Counter
 
 from ai_tools import (
@@ -119,6 +121,34 @@ def semantic_search(query, limit=20):
         if score:
             scored.append({**row, "semantic_score": round(score, 4)})
     return sorted(scored, key=lambda item: (-item["semantic_score"], -item.get("score", 0)))[:limit]
+
+
+def hybrid_search(query, limit=20, domain=None, attr=None, synonyms=None):
+    """关键词命中与本地语义相似度融合，保留两种命中证据。"""
+    keyword_rows = search_knowledge(query, limit=limit * 3, domain=domain, attr=attr, synonyms=synonyms)
+    semantic_rows = semantic_search(query, limit=limit * 3)
+    if domain or attr:
+        semantic_rows = [row for row in semantic_rows if
+                         (not domain or str(domain).upper() == _category_code(_field(_read_text(row["path"]), "领域", ""), "[A-Z]"))
+                         and (not attr or str(attr).upper() == _category_code(_field(_read_text(row["path"]), "属性", ""), "P"))]
+    merged = {}
+    for row in keyword_rows:
+        merged[row["path"]] = {**row, "keyword_score": float(row.get("score", 0)), "semantic_score": 0.0,
+                                "match_types": ["关键词"]}
+    for row in semantic_rows:
+        current = merged.setdefault(row["path"], {**row, "keyword_score": 0.0, "semantic_score": 0.0,
+                                                   "match_types": []})
+        current["semantic_score"] = max(current.get("semantic_score", 0.0), float(row.get("semantic_score", 0.0)))
+        if "语义相似" not in current["match_types"]:
+            current["match_types"].append("语义相似")
+        current.setdefault("evidence", row.get("evidence", row.get("snippet", "")))
+    results = []
+    max_keyword = max((row["keyword_score"] for row in merged.values()), default=1.0)
+    for row in merged.values():
+        row["hybrid_score"] = round(0.55 * row["keyword_score"] / max(max_keyword, 1.0) +
+                                     0.45 * row["semantic_score"], 4)
+        results.append(row)
+    return sorted(results, key=lambda item: (-item["hybrid_score"], item["name"]))[:limit]
 
 
 def find_related_documents(path, limit=10):
@@ -366,6 +396,101 @@ def summarize_similar_issues(query="", limit=20):
             "sources": sources,
         })
     return sorted(output, key=lambda item: (-item["count"], item["domain"], item["attr"]))[:limit]
+
+
+def _merge_review_path():
+    folder = os.path.join(get_kb_path(), "09_周期汇总")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "问题归并审核.json")
+
+
+def _load_merge_reviews():
+    try:
+        with open(_merge_review_path(), encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _save_merge_reviews(items):
+    path = _merge_review_path()
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(items, stream, ensure_ascii=False, indent=2)
+    os.replace(temporary, path)
+
+
+def propose_issue_merges(query="", threshold=0.16):
+    """生成待人工确认的相似问题归并建议，不直接改变任何台账。"""
+    rows = _ledger_findings(query)
+    proposals = _load_merge_reviews()
+    known = {item.get("proposal_id") for item in proposals}
+    for index, left in enumerate(rows):
+        for right in rows[index + 1:]:
+            if (left.get("domain_code"), left.get("attr_code")) != (right.get("domain_code"), right.get("attr_code")):
+                continue
+            left_tokens, right_tokens = _issue_tokens(left.get("issue")), _issue_tokens(right.get("issue"))
+            score = len(left_tokens & right_tokens) / max(len(left_tokens | right_tokens), 1)
+            if score < threshold:
+                continue
+            pair = sorted([left["path"], right["path"]])
+            proposal_id = "MERGE-" + hashlib.sha256("|".join(pair).encode("utf-8")).hexdigest()[:12].upper()
+            if proposal_id in known:
+                continue
+            proposals.append({
+                "proposal_id": proposal_id, "status": "pending", "score": round(score, 4),
+                "domain": left.get("domain"), "attr": left.get("attr"),
+                "paths": pair, "titles": [left.get("title"), right.get("title")],
+                "reason": "领域、属性一致，问题文字存在相似片段，建议人工确认是否归并。",
+            })
+    _save_merge_reviews(proposals)
+    return [item for item in proposals if item.get("status") == "pending"]
+
+
+def list_issue_merge_reviews(status=None):
+    items = _load_merge_reviews()
+    return [item for item in items if not status or item.get("status") == status]
+
+
+def review_issue_merge(proposal_id, decision, reviewer="", note=""):
+    if decision not in {"approve", "reject"}:
+        raise ValueError("归并审核只能是 approve 或 reject")
+    items = _load_merge_reviews()
+    for item in items:
+        if item.get("proposal_id") == proposal_id:
+            item.update({"status": "approved" if decision == "approve" else "rejected",
+                         "reviewer": reviewer, "reviewed_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                         "note": note})
+            _save_merge_reviews(items)
+            return item
+    raise KeyError(proposal_id)
+
+
+def apply_approved_merges():
+    """把批准的归并写成新的审核结果文件，保留原始台账不变。"""
+    items = _load_merge_reviews()
+    applied = []
+    out_dir = os.path.join(get_kb_path(), "11_重复与冲突")
+    os.makedirs(out_dir, exist_ok=True)
+    for item in items:
+        if item.get("status") != "approved" or item.get("applied_at"):
+            continue
+        source_rows = []
+        for path in item.get("paths", []):
+            source_rows.extend(_parse_ledger(path))
+        path = os.path.join(out_dir, f"归并结果_{item['proposal_id']}.md")
+        content = (f"# 人工确认的问题归并\n\n- **归并编号**：{item['proposal_id']}\n"
+                   f"- **领域/属性**：{item.get('domain')} / {item.get('attr')}\n"
+                   f"- **审核人**：{item.get('reviewer', '')}\n\n## 归并问题\n\n" +
+                   "\n".join(f"- {row.get('issue', '')}" for row in source_rows) +
+                   "\n\n## 原始资料\n\n" + "\n".join(f"- {row.get('path')}：{row.get('evidence', '')}" for row in source_rows) + "\n")
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(content)
+        item["applied_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        item["result_path"] = path
+        applied.append(dict(item))
+    _save_merge_reviews(items)
+    return applied
 
 
 def format_issue_summary(groups):

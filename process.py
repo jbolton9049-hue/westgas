@@ -221,6 +221,20 @@ def assess_ocr_quality(text, extraction_method):
     replacement = value.count("�")
     chinese = len(re.findall(r"[\u4e00-\u9fff]", value))
     warnings = []
+    page_values = [part.strip() for part in re.split(r"(?:===PAGE\s+\d+===|\n\s*\n)", value) if part.strip()]
+    pages = []
+    for index, page in enumerate(page_values or [value], 1):
+        page_replacement = page.count("�")
+        page_chinese = len(re.findall(r"[\u4e00-\u9fff]", page))
+        page_warning = []
+        if "OCR" in str(extraction_method) and len(page) < 40:
+            page_warning.append("文字偏少")
+        if page_replacement:
+            page_warning.append("含异常字符")
+        pages.append({"page": index, "characters": len(page),
+                      "chinese_characters": page_chinese,
+                      "warning": "；".join(page_warning),
+                      "needs_manual_review": bool(page_warning)})
     if not value.strip():
         warnings.append("未提取到文字")
     if "OCR" in str(extraction_method) and len(value.strip()) < 80:
@@ -235,6 +249,9 @@ def assess_ocr_quality(text, extraction_method):
         "chinese_characters": chinese,
         "warning": "；".join(warnings) if warnings else "",
         "level": "需复核" if warnings else "正常",
+        "page_count": len(pages),
+        "pages": pages,
+        "needs_manual_review": bool(warnings or any(page["needs_manual_review"] for page in pages)),
     }
 
 

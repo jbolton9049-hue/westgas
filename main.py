@@ -23,6 +23,7 @@ import maintenance
 import scheduled_tasks
 import backup
 import task_manager
+import secure_store
 from ai_tools import (
     load_config,
     save_config,
@@ -278,6 +279,7 @@ class App(tk.Tk):
 
         items = [
             ("📥 资料收集（单个 / 批量）", self.open_collect),
+            ("🧭 统一任务中心", self.open_task_center),
             ("🔎 知识检索", self.open_search),
             ("🎯 智能记忆训练", self.open_train),
             ("📘 规则版原则与改进记录", self.open_rule_guide),
@@ -292,6 +294,52 @@ class App(tk.Tk):
         tk.Button(self, text="退出", command=self.destroy, font=FONT,
                   bg=COLORS["red"], fg="#fff", relief="flat", bd=0,
                   activebackground="#962c2c", width=30, pady=10, cursor="hand2").pack(fill="x", padx=30, pady=(20, 22))
+
+    def open_task_center(self):
+        win = _BaseWin("统一任务中心", 980, 650)
+        manager = task_manager.TaskManager(proc.get_kb_path())
+        center_view = task_manager.TaskCenter(manager)
+        selected = {"task_id": None}
+        tk.Label(win, text="所有批量处理、OCR、检索和治理任务统一显示在这里。程序重启后可恢复未完成任务。",
+                 font=FONT_SMALL, bg=COLORS["bg"], fg=COLORS["muted"], anchor="w").pack(fill="x", padx=16, pady=(12, 6))
+        listbox = tk.Listbox(win, font=FONT, height=18, exportselection=False)
+        listbox.pack(fill="both", expand=True, padx=16, pady=8)
+        task_rows = []
+
+        def refresh():
+            task_rows[:] = center_view.snapshot()
+            listbox.delete(0, "end")
+            for item in task_rows:
+                listbox.insert("end", f"{item['task_id']}｜{item.get('status')}｜{item.get('name')}｜{item.get('completed', 0)}/{item.get('total', 0)}｜{item.get('error', '')}")
+            if task_rows:
+                listbox.selection_set(0)
+                selected["task_id"] = task_rows[0]["task_id"]
+
+        def select(_event=None):
+            picks = listbox.curselection()
+            if picks and picks[0] < len(task_rows):
+                selected["task_id"] = task_rows[picks[0]]["task_id"]
+
+        def operate(action):
+            select()
+            task_id = selected.get("task_id")
+            if not task_id:
+                return
+            try:
+                getattr(center_view, action)(task_id)
+                refresh()
+            except Exception as exc:
+                messagebox.showerror("任务操作失败", str(exc), parent=win)
+
+        listbox.bind("<<ListboxSelect>>", select)
+        buttons = tk.Frame(win, bg=COLORS["bg"])
+        buttons.pack(pady=(0, 12))
+        for label, action in (("刷新", None), ("暂停", "pause"), ("继续", "resume"),
+                              ("取消", "cancel"), ("失败重试", "retry")):
+            tk.Button(buttons, text=label, font=FONT_SMALL,
+                      command=refresh if action is None else lambda name=action: operate(name),
+                      bg=COLORS["surface"], fg=COLORS["navy"], relief="flat", padx=12).pack(side="left", padx=4)
+        refresh()
 
     def open_rule_guide(self):
         win = _BaseWin("规则版处理原则与反馈", 900, 680)
@@ -897,6 +945,9 @@ class App(tk.Tk):
                 for name, r in proc.process_files(paths, var.get()):
                     if r.get("ok"):
                         win.out(f"✅ {name}：处理完成，提取 {r['chars']} 字符")
+                        quality = r.get("ocr_quality") or {}
+                        if quality.get("needs_manual_review"):
+                            win.out(f"   ⚠️ OCR质量：{quality.get('level')}；{quality.get('warning') or '请逐页对照原图复核'}")
                         win.out(f"   打标：领域={r['tag'].get('domain')} 属性={r['tag'].get('attr')}（工具:{r['tag'].get('tool')}）")
                         win.out(f"   原始资料：{r['raw_file']}")
                         win.out(f"   台账：{r['ledger_file']}")
@@ -933,6 +984,9 @@ class App(tk.Tk):
                 for fname, r in results:
                     if r.get("ok"):
                         win.out(f"   ✔ {fname} -> 领域{r['tag'].get('domain')}/属性{r['tag'].get('attr')}")
+                        quality = r.get("ocr_quality") or {}
+                        if quality.get("needs_manual_review"):
+                            win.out(f"      OCR质量：{quality.get('level')}；{quality.get('warning') or '需要逐页复核'}")
                         trace = r.get("processing_trace") or (r.get("analysis") or {}).get("processing_trace") or {}
                         win.out(f"      调用：{trace.get('actual_tool', '未记录')}；回退={'是' if trace.get('fallback') else '否'}")
                     else:
@@ -1104,12 +1158,12 @@ class App(tk.Tk):
                 return
             domain_code = _code_from_label(domain_var.get()) if domain_var.get() != "全部" else None
             attr_code = _code_from_label(attr_var.get()) if attr_var.get() != "全部" else None
-            rows = search.search_knowledge(query.get(), domain=domain_code, attr=attr_code)
+            rows = search.hybrid_search(query.get(), domain=domain_code, attr=attr_code)
             if not rows:
                 result_box.insert("end", "没有找到匹配内容。\n")
                 return
             for index, row_data in enumerate(rows, 1):
-                result_box.insert("end", f"[{index}] 命中 {row_data['score']}：{row_data['name']}\n")
+                result_box.insert("end", f"[{index}] 综合得分 {row_data['hybrid_score']}｜{','.join(row_data.get('match_types', []))}：{row_data['name']}\n")
                 result_box.insert("end", f"路径：{row_data['path']}\n摘要：{row_data['snippet']}\n原文依据：{row_data.get('evidence', row_data['snippet'])}\n\n")
 
         def save_summary():
@@ -1156,9 +1210,44 @@ class App(tk.Tk):
             result_box.insert("end", f"专题报告已生成：\n{path}\n\n")
             result_box.insert("end", search.generate_topic_report(topic))
 
+        def open_merge_review():
+            proposals = search.propose_issue_merges(query.get().strip())
+            review = tk.Toplevel(win)
+            review.title("问题归并人工确认")
+            review.transient(win)
+            review.configure(bg=COLORS["bg"])
+            center(review, 900, 560)
+            tk.Label(review, text="系统只提出归并建议，批准后才生成归并结果；原始台账不会被覆盖。",
+                     font=FONT_SMALL, bg=COLORS["bg"], fg=COLORS["muted"]).pack(fill="x", padx=16, pady=10)
+            box = tk.Listbox(review, font=FONT_SMALL, height=14, exportselection=False)
+            box.pack(fill="both", expand=True, padx=16, pady=6)
+            rows = proposals[:]
+            for item in rows:
+                box.insert("end", f"{item['proposal_id']}｜相似度 {item['score']}｜{item['titles'][0]} ⇄ {item['titles'][1]}")
+            def decide(value):
+                picks = box.curselection()
+                if not picks:
+                    return
+                item = rows[picks[0]]
+                search.review_issue_merge(item["proposal_id"], value, "当前用户")
+                rows[picks[0]]["status"] = "approved" if value == "approve" else "rejected"
+                box.delete(picks[0])
+                box.insert(picks[0], f"{item['proposal_id']}｜已{'同意' if value == 'approve' else '拒绝'}")
+            def apply():
+                applied = search.apply_approved_merges()
+                messagebox.showinfo("归并完成", f"已生成 {len(applied)} 个归并结果。", parent=review)
+            controls = tk.Frame(review, bg=COLORS["bg"])
+            controls.pack(pady=10)
+            tk.Button(controls, text="同意归并", font=FONT_SMALL, command=lambda: decide("approve")).pack(side="left", padx=5)
+            tk.Button(controls, text="不同意归并", font=FONT_SMALL, command=lambda: decide("reject")).pack(side="left", padx=5)
+            tk.Button(controls, text="应用已同意归并", font=FONT_SMALL, command=apply).pack(side="left", padx=5)
+            tk.Button(controls, text="关闭", font=FONT_SMALL, command=review.destroy).pack(side="left", padx=5)
+
         tk.Button(row, text="趋势统计", font=FONT_SMALL, command=show_trends,
                   bg="#ffffff", fg=COLORS["navy"], relief="flat", padx=8).pack(side="right", padx=(0, 8))
         tk.Button(row, text="生成专题报告", font=FONT_SMALL, command=save_topic_report,
+                  bg="#ffffff", fg=COLORS["navy"], relief="flat", padx=8).pack(side="right", padx=(0, 8))
+        tk.Button(row, text="问题归并审核", font=FONT_SMALL, command=open_merge_review,
                   bg="#ffffff", fg=COLORS["navy"], relief="flat", padx=8).pack(side="right", padx=(0, 8))
         query.bind("<Return>", lambda _: do_search())
 
@@ -1587,7 +1676,8 @@ class App(tk.Tk):
                 return
             c["knowledge_base"] = kb_path
             if ak:
-                c["ai_tools"][key]["api_key"] = ak
+                secure_store.set_secret(key, ak, os.path.join(os.path.dirname(CONFIG_PATH), ".secrets"))
+                c["ai_tools"][key]["api_key"] = ""
                 c["ai_tools"][key]["enabled"] = True
             check = validate_config(c)
             if not check["ok"]:

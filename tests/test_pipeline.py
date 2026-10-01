@@ -17,6 +17,7 @@ import scheduled_tasks
 import knowledge_db
 import backup
 import task_manager
+import secure_store
 
 
 class PipelineTest(unittest.TestCase):
@@ -399,6 +400,55 @@ class PipelineTest(unittest.TestCase):
         self.assertIsInstance(links, list)
         report = search.generate_topic_report("排查")
         self.assertIn("专题报告", report)
+
+    def test_task_center_lists_and_operates_all_tasks(self):
+        manager = task_manager.TaskManager(os.path.join(self.tmp.name, "kb"))
+        first = manager.create("OCR", ["a.pdf"])
+        second = manager.create("检索", ["q"])
+        center = task_manager.TaskCenter(manager)
+        self.assertEqual(len(center.snapshot()), 2)
+        center.cancel(first["task_id"])
+        self.assertEqual(center.get(first["task_id"])["status"], "cancelled")
+        self.assertEqual(center.get(second["task_id"])["status"], "queued")
+
+    def test_ocr_quality_has_page_level_review_fields(self):
+        report = process.assess_ocr_quality("第一页文字\n\n第二页文字", "Windows中文OCR")
+        self.assertIn("pages", report)
+        self.assertGreaterEqual(report["page_count"], 2)
+        self.assertIn("needs_manual_review", report)
+
+    def test_secure_store_round_trip_and_no_plaintext_requirement(self):
+        secret_path = os.path.join(self.tmp.name, "secrets")
+        secure_store.set_secret("deepseek", "secret-value", secret_path)
+        self.assertEqual(secure_store.get_secret("deepseek", secret_path), "secret-value")
+        with open(os.path.join(secret_path, "deepseek.secret"), "rb") as stream:
+            self.assertNotIn(b"secret-value", stream.read())
+        secure_store.delete_secret("deepseek", secret_path)
+        self.assertIsNone(secure_store.get_secret("deepseek", secret_path))
+
+    def test_hybrid_search_combines_keyword_and_semantic_results(self):
+        base = os.path.join(self.tmp.name, "kb", "02_分类台账")
+        os.makedirs(base, exist_ok=True)
+        with open(os.path.join(base, "风险排查.md"), "w", encoding="utf-8") as stream:
+            stream.write("# 风险排查\n- **领域**：B3 安全管理\n- **属性**：P1 管理问题或缺陷\n\n隐患排查必须及时闭环。")
+        rows = search.hybrid_search("隐患排查")
+        self.assertTrue(rows)
+        self.assertIn("hybrid_score", rows[0])
+        self.assertIn("match_types", rows[0])
+
+    def test_issue_merge_requires_human_approval_before_apply(self):
+        base = os.path.join(self.tmp.name, "kb", "02_分类台账")
+        os.makedirs(base, exist_ok=True)
+        for index, issue in enumerate(("隐患排查不到位", "隐患排查不及时"), 1):
+            with open(os.path.join(base, f"合并_{index}.md"), "w", encoding="utf-8") as stream:
+                stream.write(f"# 台账\n- **领域**：B3 安全管理\n- **属性**：P1 管理问题或缺陷\n\n## 二、问题定性\n\n{issue}\n")
+        proposals = search.propose_issue_merges()
+        self.assertTrue(proposals)
+        self.assertEqual(proposals[0]["status"], "pending")
+        self.assertEqual(search.apply_approved_merges(), [])
+        search.review_issue_merge(proposals[0]["proposal_id"], "approve", "测试人员")
+        applied = search.apply_approved_merges()
+        self.assertEqual(len(applied), 1)
 
     def test_sqlite_index_accelerates_markdown_search_and_is_rebuildable(self):
         ledger_dir = os.path.join(self.tmp.name, "kb", "02_分类台账")

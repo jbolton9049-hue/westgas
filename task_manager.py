@@ -116,6 +116,33 @@ class TaskManager:
         return self.list({"queued", "running", "paused", "retrying", "failed"})
 
 
+class TaskCenter:
+    """统一任务中心外观，所有窗口通过同一管理器读取和操作任务。"""
+    def __init__(self, manager):
+        self.manager = manager
+
+    def snapshot(self):
+        return sorted(self.manager.list(), key=lambda item: item.get("updated_at", ""), reverse=True)
+
+    def get(self, task_id):
+        return self.manager.get(task_id)
+
+    def pause(self, task_id):
+        return self.manager.pause(task_id)
+
+    def resume(self, task_id):
+        return self.manager.resume(task_id)
+
+    def cancel(self, task_id):
+        return self.manager.cancel(task_id)
+
+    def retry(self, task_id):
+        return self.manager.retry(task_id)
+
+    def recover(self):
+        return self.manager.recover_unfinished()
+
+
 def process_with_manager(manager, task_id, items, worker, progress=None):
     """执行批量 worker；支持取消/暂停检查并保留每项进度。"""
     results = []
