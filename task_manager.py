@@ -139,7 +139,11 @@ def process_with_manager(manager, task_id, items, worker, progress=None):
             if progress:
                 progress(index, len(items), item, result)
         except Exception as exc:
-            manager.update(task_id, completed=index, current=str(item), status="failed", error=str(exc), failed=1)
+            prior = manager.get(task_id) or {}
+            # Keep the failed item as the resume point so retry() retries it
+            # instead of silently skipping it after a crash or transient error.
+            manager.update(task_id, completed=max(index - 1, 0), current=str(item),
+                           status="failed", error=str(exc), failed=int(prior.get("failed", 0)) + 1)
             results.append(exc)
             if progress:
                 progress(index, len(items), item, {"ok": False, "msg": str(exc)})

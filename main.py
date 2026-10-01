@@ -1146,7 +1146,19 @@ class App(tk.Tk):
             for item in trends:
                 result_box.insert("end", f"{item['month']}｜{item['domain']} / {item['attr']}：{item['count']} 条\n")
 
+        def save_topic_report():
+            topic = query.get().strip()
+            if not topic:
+                messagebox.showwarning("提示", "请先输入专题关键词。", parent=win)
+                return
+            path = search.save_topic_report(topic)
+            result_box.delete("1.0", "end")
+            result_box.insert("end", f"专题报告已生成：\n{path}\n\n")
+            result_box.insert("end", search.generate_topic_report(topic))
+
         tk.Button(row, text="趋势统计", font=FONT_SMALL, command=show_trends,
+                  bg="#ffffff", fg=COLORS["navy"], relief="flat", padx=8).pack(side="right", padx=(0, 8))
+        tk.Button(row, text="生成专题报告", font=FONT_SMALL, command=save_topic_report,
                   bg="#ffffff", fg=COLORS["navy"], relief="flat", padx=8).pack(side="right", padx=(0, 8))
         query.bind("<Return>", lambda _: do_search())
 

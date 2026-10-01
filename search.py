@@ -164,6 +164,16 @@ def generate_topic_report(topic):
     return "\n".join(lines)
 
 
+def save_topic_report(topic):
+    folder = os.path.join(get_kb_path(), "09_周期汇总")
+    os.makedirs(folder, exist_ok=True)
+    safe = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", str(topic).strip())[:60] or "专题"
+    path = os.path.join(folder, f"专题报告_{safe}_{datetime.date.today().isoformat()}.md")
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write(generate_topic_report(topic))
+    return path
+
+
 def _issue_tokens(text):
     """Tokenize Chinese issue text without requiring an external NLP package."""
     text = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]+", "", str(text or "")).lower()
