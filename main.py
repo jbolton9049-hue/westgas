@@ -10,6 +10,7 @@
 
 import os
 import re
+import datetime
 import threading
 import queue
 import tkinter as tk
@@ -24,6 +25,7 @@ import scheduled_tasks
 import backup
 import task_manager
 import secure_store
+import migration
 from ai_tools import (
     load_config,
     save_config,
@@ -1769,6 +1771,54 @@ class App(tk.Tk):
                   relief="flat", padx=10, pady=5).pack(side="left", padx=4)
         tk.Button(backup_row, text="恢复知识库备份", font=FONT_SMALL,
                   command=restore_backup, bg="#ffffff", fg="#7a3434",
+                  relief="flat", padx=10, pady=5).pack(side="left", padx=4)
+        migration_label = tk.Label(win, text="系统迁移：迁移知识库、训练记录、任务状态和规则反馈；API Key 不打包。",
+                                   font=("Microsoft YaHei", 10), bg=COLORS["bg"], fg=COLORS["muted"])
+        migration_label.pack(pady=(12, 3))
+        migration_row = tk.Frame(win, bg=COLORS["bg"])
+        migration_row.pack(pady=3)
+
+        def create_migration_package():
+            default_name = f"天然气管理系统迁移包_{datetime.date.today().isoformat()}.zip"
+            target = filedialog.asksaveasfilename(title="保存系统迁移包", initialfile=default_name,
+                                                  defaultextension=".zip", filetypes=[("系统迁移包", "*.zip")], parent=win)
+            if not target:
+                return
+            try:
+                path = migration.create_package(proc.get_kb_path(), target, load_config(),
+                                                os.path.join(os.path.dirname(CONFIG_PATH), ".secrets"))
+                show_job(f"✅ 系统迁移包已创建：{path}\nAPI Key 未包含在迁移包中。")
+            except Exception as exc:
+                show_job(f"❌ 创建迁移包失败：{exc}")
+
+        def restore_migration_package():
+            path = filedialog.askopenfilename(title="选择系统迁移包", filetypes=[("系统迁移包", "*.zip")], parent=win)
+            if not path:
+                return
+            target_root = filedialog.askdirectory(title="选择迁移后的知识库目录", initialdir=proc.get_kb_path(), parent=win)
+            if not target_root:
+                return
+            try:
+                info = migration.inspect_package(path)
+                if not messagebox.askyesno("确认系统迁移", f"迁移包包含 {info.get('file_count', 0)} 个文件。\n目标目录：{target_root}\n继续吗？", parent=win):
+                    return
+                result = migration.restore_package(path, target_root)
+                current = load_config()
+                imported = result.get("config") or {}
+                current["knowledge_base"] = target_root
+                if imported.get("default_tool") in {"rule", "deepseek", "doubao"}:
+                    current["default_tool"] = imported["default_tool"]
+                save_config(current)
+                proc.ensure_knowledge_base()
+                show_job(f"✅ 系统迁移完成：恢复 {result['restored_files']} 个文件。\n恢复前安全备份：{result['safety_backup']}\n请重新配置目标电脑 API Key。")
+            except Exception as exc:
+                show_job(f"❌ 系统迁移失败：{exc}")
+
+        tk.Button(migration_row, text="创建系统迁移包", font=FONT_SMALL,
+                  command=create_migration_package, bg="#ffffff", fg=COLORS["navy"],
+                  relief="flat", padx=10, pady=5).pack(side="left", padx=4)
+        tk.Button(migration_row, text="恢复系统迁移包", font=FONT_SMALL,
+                  command=restore_migration_package, bg="#ffffff", fg="#7a3434",
                   relief="flat", padx=10, pady=5).pack(side="left", padx=4)
         schedule_row = tk.Frame(win, bg=COLORS["bg"])
         schedule_row.pack(pady=3)

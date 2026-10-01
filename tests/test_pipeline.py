@@ -18,6 +18,7 @@ import knowledge_db
 import backup
 import task_manager
 import secure_store
+import migration
 
 
 class PipelineTest(unittest.TestCase):
@@ -449,6 +450,26 @@ class PipelineTest(unittest.TestCase):
         search.review_issue_merge(proposals[0]["proposal_id"], "approve", "测试人员")
         applied = search.apply_approved_merges()
         self.assertEqual(len(applied), 1)
+
+    def test_system_migration_package_round_trip_excludes_secrets(self):
+        kb = os.path.join(self.tmp.name, "kb")
+        os.makedirs(os.path.join(kb, "09_周期汇总"), exist_ok=True)
+        with open(os.path.join(kb, "09_周期汇总", "规则版反馈.jsonl"), "w", encoding="utf-8") as stream:
+            stream.write('{"reviewed_domain":"B3"}\n')
+        with open(os.path.join(kb, "09_周期汇总", "任务状态.json"), "w", encoding="utf-8") as stream:
+            stream.write('{"tasks": {}}')
+        secret_dir = os.path.join(self.tmp.name, ".secrets")
+        secure_store.set_secret("deepseek", "should-not-export", secret_dir)
+        package = migration.create_package(kb, os.path.join(self.tmp.name, "迁移包.zip"),
+                                           config={"knowledge_base": kb, "default_tool": "rule", "ai_tools": {"deepseek": {"api_key": ""}}},
+                                           secret_root=secret_dir)
+        info = migration.inspect_package(package)
+        self.assertEqual(info["format_version"], 1)
+        self.assertFalse(info["contains_secrets"])
+        restored = os.path.join(self.tmp.name, "restored")
+        result = migration.restore_package(package, restored)
+        self.assertTrue(os.path.isfile(os.path.join(restored, "09_周期汇总", "规则版反馈.jsonl")))
+        self.assertTrue(os.path.isfile(result["safety_backup"]))
 
     def test_sqlite_index_accelerates_markdown_search_and_is_rebuildable(self):
         ledger_dir = os.path.join(self.tmp.name, "kb", "02_分类台账")
