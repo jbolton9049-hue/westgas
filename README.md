@@ -1,6 +1,6 @@
 # 天然气管理知识工具
 
-版本：**v1.1.0**
+版本：**v1.2.0**
 
 面向天然气企业管理资料的桌面知识治理工具。它把制度资料、管理问题、解决措施、事件分析和记忆训练连接起来，形成“资料收集 → 自动处理 → 人工审核 → 知识沉淀 → 检索复用 → 周期治理”的闭环。
 
@@ -15,6 +15,7 @@
 - 智能记忆训练：待审核卡片、间隔重复、掌握度、薄弱清单和提醒。
 - 周期治理：新增/修改/删除/重复检测、待审核草稿、周报、月报和哈希校验发布。
 - v1.1 改进：周期草稿可视化审核、原子写入、任务审计、SQLite 可重建索引、版本快照差异、相似资料识别和知识库备份恢复。
+- v1.2 改进：统一任务编号与状态、批量进度/暂停/取消/恢复、AI与规则版调用审计、OCR质量提示、配置校验与环境变量密钥、SQLite迁移、证据检索、分类筛选、趋势统计、轻量语义检索、跨文档关联和专题报告。
 
 ## 快速开始
 
@@ -32,7 +33,7 @@ Copy-Item config.example.json config.json
 python main.py
 ```
 
-规则版不需要网络或 API Key，可以先完成完整流程。API Key 只保存在本地 `config.json`，该文件已加入 Git 忽略规则。
+规则版不需要网络或 API Key，可以先完成完整流程。API Key 可使用 `WESTGAS_DEEPSEEK_API_KEY` 或 `WESTGAS_DOUBAO_API_KEY` 环境变量，避免写入配置文件。
 
 ## 文档
 
@@ -43,7 +44,7 @@ python main.py
 ## 测试
 
 ```powershell
-python -m py_compile main.py process.py ai_tools.py
+python -m py_compile main.py process.py ai_tools.py search.py knowledge_db.py task_manager.py
 python -m unittest discover -s tests -v
 ```
 

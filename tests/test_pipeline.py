@@ -16,6 +16,7 @@ import maintenance
 import scheduled_tasks
 import knowledge_db
 import backup
+import task_manager
 
 
 class PipelineTest(unittest.TestCase):
@@ -334,6 +335,70 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(groups[0]["count"], 2)
         self.assertTrue(groups[0]["measures"])
         self.assertIn("建议措施", search.format_issue_summary(groups))
+
+    def test_task_manager_persists_status_and_recovers_unfinished_task(self):
+        manager = task_manager.TaskManager(os.path.join(self.tmp.name, "kb"))
+        task = manager.create("资料批量处理", ["a.txt", "b.txt"])
+        self.assertTrue(task["task_id"].startswith("TASK-"))
+        manager.update(task["task_id"], status="paused", completed=1, current="a.txt")
+        restored = task_manager.TaskManager(os.path.join(self.tmp.name, "kb"))
+        pending = restored.recover_unfinished()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["status"], "paused")
+        self.assertEqual(pending[0]["completed"], 1)
+
+    def test_task_manager_cancel_retry_and_progress_callback(self):
+        manager = task_manager.TaskManager(os.path.join(self.tmp.name, "kb"))
+        task = manager.create("批量处理", ["a.txt"])
+        manager.update(task["task_id"], status="failed", error="网络失败")
+        retry = manager.retry(task["task_id"])
+        self.assertEqual(retry["status"], "queued")
+        manager.cancel(retry["task_id"])
+        self.assertTrue(manager.is_cancelled(retry["task_id"]))
+
+    def test_ai_call_audit_and_rule_version_are_recorded(self):
+        result = ai_tools.process_by_tool("站场隐患排查不到位", task="tag", tool_key="rule")
+        self.assertEqual(result["tool"], "rule")
+        log_path = os.path.join(self.tmp.name, "kb", "00_系统说明", "AI调用日志.jsonl")
+        self.assertTrue(os.path.isfile(log_path))
+        with open(log_path, encoding="utf-8") as stream:
+            records = [json.loads(line) for line in stream if line.strip()]
+        self.assertTrue(records)
+        self.assertEqual(records[-1]["task"], "tag")
+        self.assertIn("version", records[-1])
+
+    def test_ocr_quality_warning_and_config_validation(self):
+        self.assertTrue(ai_tools.validate_config({"knowledge_base": "kb", "default_tool": "rule", "ai_tools": {}})["ok"])
+        self.assertFalse(ai_tools.validate_config({"knowledge_base": "", "default_tool": "bad", "ai_tools": {}})["ok"])
+        result = process.prepare_file(self.source, "rule")
+        self.assertIn("ocr_quality", result)
+        self.assertIn("warning", result["ocr_quality"])
+
+    def test_database_migration_and_filtered_evidence_search(self):
+        ledger_dir = os.path.join(self.tmp.name, "kb", "02_分类台账")
+        os.makedirs(ledger_dir, exist_ok=True)
+        with open(os.path.join(ledger_dir, "台账_安全.md"), "w", encoding="utf-8") as stream:
+            stream.write("# 台账\n- **领域**：B3 安全管理\n- **属性**：P1 管理问题或缺陷\n- **来源**：制度A\n\n## 二、问题定性\n\n隐患排查不到位\n")
+        knowledge_db.ensure_schema(self.tmp.name + "/kb")
+        self.assertGreaterEqual(knowledge_db.schema_version(self.tmp.name + "/kb"), 2)
+        rows = search.search_knowledge("隐患", domain="B3", attr="P1", synonyms={"隐患": ["风险"]})
+        self.assertTrue(rows)
+        self.assertTrue(rows[0].get("evidence"))
+
+    def test_issue_trends_semantic_links_and_topic_report(self):
+        ledger_dir = os.path.join(self.tmp.name, "kb", "02_分类台账")
+        os.makedirs(ledger_dir, exist_ok=True)
+        for index, issue in enumerate(("隐患排查不到位", "风险排查不及时"), 1):
+            with open(os.path.join(ledger_dir, f"台账_{index}.md"), "w", encoding="utf-8") as stream:
+                stream.write(f"# 台账\n- **领域**：B3 安全管理\n- **属性**：P1 管理问题或缺陷\n- **日期**：2026-10-0{index}\n\n## 二、问题定性\n\n{issue}\n")
+        trends = search.issue_trends()
+        self.assertTrue(trends)
+        semantic = search.semantic_search("风险隐患排查")
+        self.assertTrue(semantic)
+        links = search.find_related_documents(semantic[0]["path"])
+        self.assertIsInstance(links, list)
+        report = search.generate_topic_report("排查")
+        self.assertIn("专题报告", report)
 
     def test_sqlite_index_accelerates_markdown_search_and_is_rebuildable(self):
         ledger_dir = os.path.join(self.tmp.name, "kb", "02_分类台账")

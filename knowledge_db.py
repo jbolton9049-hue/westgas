@@ -12,6 +12,9 @@ import sqlite3
 from contextlib import contextmanager
 
 
+CURRENT_SCHEMA_VERSION = 2
+
+
 def db_path(root):
     return os.path.join(root, "00_系统说明", "知识库索引.sqlite3")
 
@@ -61,6 +64,20 @@ def init(conn):
         );
         """
     )
+    version = conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
+    if not version:
+        conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES('schema_version','1')")
+        version_value = 1
+    else:
+        version_value = int(version[0])
+    # v2 adds fields used by evidence filtering and governance dashboards.
+    if version_value < 2:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(documents)")}
+        if "domain_code" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN domain_code TEXT")
+        if "attr_code" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN attr_code TEXT")
+        conn.execute("UPDATE db_meta SET value='2' WHERE key='schema_version'")
     # The FTS table is a rebuildable acceleration structure, not source data.
     # Keep it standalone so SQLite versions on older Windows installations do
     # not produce an external-content rowid mismatch.
@@ -70,6 +87,19 @@ def init(conn):
         conn.execute("CREATE VIRTUAL TABLE documents_fts USING fts5(name, content)")
         conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES('fts_mode','standalone-v1')")
     conn.commit()
+
+
+def ensure_schema(root):
+    """Run idempotent database migrations and return the current version."""
+    with connect(root) as conn:
+        row = conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
+        return int(row[0]) if row else 1
+
+
+def schema_version(root):
+    with connect(root) as conn:
+        row = conn.execute("SELECT value FROM db_meta WHERE key='schema_version'").fetchone()
+        return int(row[0]) if row else 1
 
 
 def sync_governance_index(root, index):

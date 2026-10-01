@@ -24,12 +24,53 @@ def _terms(query):
     return values or [query.strip()]
 
 
-def search_knowledge(query, limit=30):
+def _evidence(path, terms, width=320):
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as stream:
+            text = stream.read()
+    except OSError:
+        return ""
+    positions = [text.lower().find(term.lower()) for term in terms if term and term.lower() in text.lower()]
+    first = min(positions) if positions else 0
+    return re.sub(r"\s+", " ", text[max(0, first - 100):first + width]).strip()
+
+
+def _read_text(path):
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as stream:
+            return stream.read()
+    except OSError:
+        return ""
+
+
+def search_knowledge(query, limit=30, domain=None, attr=None, synonyms=None):
     """返回按关键词命中次数排序的 Markdown 文档。"""
     if not query or not query.strip():
         return []
+    expanded = []
+    synonym_map = synonyms or {}
+    for term in _terms(query):
+        expanded.append(term)
+        expanded.extend(synonym_map.get(term, []))
+    expanded = list(dict.fromkeys(expanded))
     try:
-        return knowledge_db.search(get_kb_path(), SEARCH_FOLDERS, query, limit)
+        rows = []
+        seen_paths = set()
+        for term in expanded:
+            for item in knowledge_db.search(get_kb_path(), SEARCH_FOLDERS, term, limit * 2):
+                if item["path"] not in seen_paths:
+                    rows.append(item)
+                    seen_paths.add(item["path"])
+        filtered = []
+        for row in rows:
+            source_text = _read_text(row["path"])
+            if domain and str(domain).upper() not in _category_code(_field(source_text, "领域", ""), "[A-Z]"):
+                continue
+            if attr and str(attr).upper() not in _category_code(_field(source_text, "属性", ""), "P"):
+                continue
+            row["evidence"] = _evidence(row["path"], expanded)
+            filtered.append(row)
+        return filtered[:limit]
     except (OSError, sqlite3.Error, ValueError):
         pass
     terms = _terms(query)
@@ -56,8 +97,71 @@ def search_knowledge(query, limit=30):
                 first = min((text.lower().find(t.lower()) for t in terms if t.lower() in text.lower()), default=0)
                 start = max(0, first - 80)
                 snippet = re.sub(r"\s+", " ", text[start:first + 220]).strip()
-                results.append({"score": score, "name": name, "path": path, "snippet": snippet})
+                if domain or attr:
+                    fields = text
+                    if domain and str(domain).upper() not in _category_code(_field(fields, "领域", ""), "[A-Z]"):
+                        continue
+                    if attr and str(attr).upper() not in _category_code(_field(fields, "属性", ""), "P"):
+                        continue
+                results.append({"score": score, "name": name, "path": path, "snippet": snippet,
+                                "evidence": _evidence(path, expanded)})
     return sorted(results, key=lambda item: (-item["score"], item["name"]))[:limit]
+
+
+def semantic_search(query, limit=20):
+    """轻量语义检索：字符二元组相似度，后续可替换为向量索引。"""
+    query_tokens = _issue_tokens(query)
+    candidates = search_knowledge(" ".join(sorted(query_tokens)), limit=limit * 5)
+    scored = []
+    for row in candidates:
+        tokens = _issue_tokens(row.get("snippet", "") + row.get("name", ""))
+        score = len(query_tokens & tokens) / max(len(query_tokens | tokens), 1)
+        if score:
+            scored.append({**row, "semantic_score": round(score, 4)})
+    return sorted(scored, key=lambda item: (-item["semantic_score"], -item.get("score", 0)))[:limit]
+
+
+def find_related_documents(path, limit=10):
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as stream:
+            text = stream.read()
+    except OSError:
+        return []
+    terms = list(_issue_tokens(text))[:20]
+    if not terms:
+        return []
+    return [row for row in search_knowledge(" ".join(terms[:5]), limit=limit + 1)
+            if os.path.abspath(row["path"]) != os.path.abspath(path)][:limit]
+
+
+def issue_trends():
+    """按月份、领域和属性统计已审核问题，供治理看板使用。"""
+    counter = Counter()
+    for row in _ledger_findings():
+        try:
+            with open(row["path"], encoding="utf-8", errors="ignore") as stream:
+                text = stream.read()
+            date = _field(text, "日期", datetime.date.today().isoformat())[:7]
+        except OSError:
+            date = datetime.date.today().isoformat()[:7]
+        counter[(date, row.get("domain", "待定"), row.get("attr", "待定"))] += 1
+    return [{"month": key[0], "domain": key[1], "attr": key[2], "count": value}
+            for key, value in sorted(counter.items())]
+
+
+def generate_topic_report(topic):
+    groups = summarize_similar_issues(topic)
+    lines = [f"# 专题报告：{topic}", "", f"生成时间：{datetime.datetime.now().isoformat(timespec='seconds')}", ""]
+    lines.append(f"共发现 {sum(item['count'] for item in groups)} 条相关已审核问题，归并为 {len(groups)} 组。\n")
+    for index, group in enumerate(groups, 1):
+        lines.append(f"## {index}. {group['summary']}（{group['domain']} / {group['attr']}）")
+        lines.extend(f"- {item}" for item in group.get("issues", [])[:5])
+        lines.append("### 建议措施")
+        lines.extend(f"{n}. {item}" for n, item in enumerate(group.get("measures", []), 1))
+        lines.append("### 原文依据")
+        lines.extend(f"- {item['name']}：{item.get('evidence', '')}" for item in group.get("sources", []))
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _issue_tokens(text):

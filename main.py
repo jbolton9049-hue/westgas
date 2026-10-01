@@ -22,6 +22,7 @@ import search
 import maintenance
 import scheduled_tasks
 import backup
+import task_manager
 from ai_tools import (
     load_config,
     save_config,
@@ -31,6 +32,8 @@ from ai_tools import (
     classification_label,
     record_rule_feedback,
     CONFIG_PATH,
+    get_api_key,
+    validate_config,
 )
 
 APP_TITLE = "天然气管理知识工具 v1.1"
@@ -872,6 +875,15 @@ class App(tk.Tk):
 
         # 记录最近一次处理结果，供"下一步"使用
         last_ledger = {"path": None, "text": "", "title": ""}
+        task_state = {"manager": task_manager.TaskManager(proc.get_kb_path()), "task": None}
+        progress_var = tk.DoubleVar(value=0)
+        progress_text = tk.StringVar(value="尚未开始批量任务")
+        progress_frame = tk.Frame(win, bg=COLORS["bg"])
+        progress_frame.pack(fill="x", padx=16, pady=(0, 4))
+        tk.Label(progress_frame, textvariable=progress_text, font=FONT_SMALL,
+                 bg=COLORS["bg"], fg=COLORS["muted"]).pack(side="left")
+        ttk.Progressbar(progress_frame, variable=progress_var, maximum=100,
+                        length=260).pack(side="right")
 
         def _single():
             paths = filedialog.askopenfilenames(
@@ -901,10 +913,23 @@ class App(tk.Tk):
             paths = choose_files_from_folder(win, "选择要处理的资料")
             if not paths:
                 return
+            task_state["task"] = task_state["manager"].create(
+                "资料批量处理", [os.path.basename(path) for path in paths], {"tool": var.get()}
+            )
+            progress_var.set(0)
+            progress_text.set(f"任务 {task_state['task']['task_id']}：准备处理 {len(paths)} 个文件")
+            def on_progress(done, total, item, result):
+                win.run_on_ui(lambda: (progress_var.set(done * 100 / max(total, 1)),
+                                        progress_text.set(f"已完成 {done}/{total}：{os.path.basename(item)}")))
             def do():
-                results = proc.process_files(paths, var.get())
+                _, results, state = proc.process_files_managed(
+                    paths, var.get(), task_state["manager"], on_progress, task_state["task"]
+                )
                 ok = sum(1 for _, r in results if r.get("ok"))
                 win.out(f"✅ 批量处理完成：成功 {ok}/{len(results)}")
+                win.run_on_ui(lambda: progress_text.set(
+                    f"任务 {state.get('task_id')}：{state.get('status')}，成功 {ok}/{len(results)}"
+                ))
                 for fname, r in results:
                     if r.get("ok"):
                         win.out(f"   ✔ {fname} -> 领域{r['tag'].get('domain')}/属性{r['tag'].get('attr')}")
@@ -919,6 +944,24 @@ class App(tk.Tk):
                         last_ledger["title"] = fname
                         last_ledger["text"] = r.get("text", "")
             win.run_async(do)
+
+        def pause_task():
+            task = task_state.get("task")
+            if task:
+                task_state["manager"].pause(task["task_id"])
+                progress_text.set("任务已暂停，可点击继续")
+
+        def resume_task():
+            task = task_state.get("task")
+            if task:
+                task_state["manager"].resume(task["task_id"])
+                progress_text.set("任务已继续")
+
+        def cancel_task():
+            task = task_state.get("task")
+            if task:
+                task_state["manager"].cancel(task["task_id"])
+                progress_text.set("任务已取消，未完成文件可稍后重试")
 
         # 下一步：提炼管理内涵
         def _next_insight():
@@ -940,6 +983,11 @@ class App(tk.Tk):
         tk.Button(win, text="选择文件 / 文件夹并处理", font=FONT,
                   command=lambda: _single() if mode.get() == "single" else _batch(),
                   bg=COLORS["navy"], fg="#fff", relief="flat", pady=8).pack(pady=10)
+        control_row = tk.Frame(win, bg=COLORS["bg"])
+        control_row.pack(pady=(0, 5))
+        tk.Button(control_row, text="暂停", font=FONT_SMALL, command=pause_task).pack(side="left", padx=4)
+        tk.Button(control_row, text="继续", font=FONT_SMALL, command=resume_task).pack(side="left", padx=4)
+        tk.Button(control_row, text="取消任务", font=FONT_SMALL, command=cancel_task).pack(side="left", padx=4)
         tk.Button(win, text="下一步：提炼管理内涵", font=FONT, command=_next_insight,
                   bg=COLORS["green"], fg="#fff", relief="flat", pady=8).pack(pady=(2, 8))
         tk.Label(win, text="提示：可用不同工具分别处理同一份资料，对比结果后由你判断。",
@@ -1031,6 +1079,20 @@ class App(tk.Tk):
         row.pack(fill="x", padx=12, pady=8)
         query = tk.Entry(row, font=FONT)
         query.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        filter_row = tk.Frame(win, bg=COLORS["bg"])
+        filter_row.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Label(filter_row, text="领域：", font=FONT_SMALL, bg=COLORS["bg"]).pack(side="left")
+        domain_var = tk.StringVar(value="全部")
+        domain_box = ttk.Combobox(filter_row, textvariable=domain_var, state="readonly",
+                                  values=["全部"] + [classification_label(k, DOMAIN_LABELS) for k in DOMAIN_LABELS],
+                                  width=25, font=FONT_SMALL)
+        domain_box.pack(side="left", padx=(2, 14))
+        tk.Label(filter_row, text="属性：", font=FONT_SMALL, bg=COLORS["bg"]).pack(side="left")
+        attr_var = tk.StringVar(value="全部")
+        attr_box = ttk.Combobox(filter_row, textvariable=attr_var, state="readonly",
+                                values=["全部"] + [classification_label(k, ATTR_LABELS) for k in ATTR_LABELS],
+                                width=27, font=FONT_SMALL)
+        attr_box.pack(side="left", padx=2)
         result_box = scrolledtext.ScrolledText(win, font=("Microsoft YaHei", 11), wrap="word")
         result_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
@@ -1040,13 +1102,15 @@ class App(tk.Tk):
                 groups = search.summarize_similar_issues(query.get())
                 result_box.insert("end", search.format_issue_summary(groups))
                 return
-            rows = search.search_knowledge(query.get())
+            domain_code = _code_from_label(domain_var.get()) if domain_var.get() != "全部" else None
+            attr_code = _code_from_label(attr_var.get()) if attr_var.get() != "全部" else None
+            rows = search.search_knowledge(query.get(), domain=domain_code, attr=attr_code)
             if not rows:
                 result_box.insert("end", "没有找到匹配内容。\n")
                 return
             for index, row_data in enumerate(rows, 1):
                 result_box.insert("end", f"[{index}] 命中 {row_data['score']}：{row_data['name']}\n")
-                result_box.insert("end", f"路径：{row_data['path']}\n摘要：{row_data['snippet']}\n\n")
+                result_box.insert("end", f"路径：{row_data['path']}\n摘要：{row_data['snippet']}\n原文依据：{row_data.get('evidence', row_data['snippet'])}\n\n")
 
         def save_summary():
             if mode.get() != "summary":
@@ -1075,6 +1139,15 @@ class App(tk.Tk):
             pady=5,
         )
         save_button.pack(side="right", padx=(0, 8))
+        def show_trends():
+            result_box.delete("1.0", "end")
+            trends = search.issue_trends()
+            result_box.insert("end", "问题趋势统计\n====================\n")
+            for item in trends:
+                result_box.insert("end", f"{item['month']}｜{item['domain']} / {item['attr']}：{item['count']} 条\n")
+
+        tk.Button(row, text="趋势统计", font=FONT_SMALL, command=show_trends,
+                  bg="#ffffff", fg=COLORS["navy"], relief="flat", padx=8).pack(side="right", padx=(0, 8))
         query.bind("<Return>", lambda _: do_search())
 
     # ---------- 5. 训练 ----------
@@ -1462,7 +1535,7 @@ class App(tk.Tk):
         txt.pack(fill="x", padx=15, pady=8)
         info = [f"知识库目录：{cfg['knowledge_base']}", f"默认工具：{cfg['default_tool']}"]
         for key, t in cfg["ai_tools"].items():
-            st = "✅启用" if t.get("enabled") and t.get("api_key") else "❌未配置"
+            st = "✅启用" if t.get("enabled") and get_api_key(key, t) else "❌未配置"
             info.append(f"{t['name']}：{st}  模型={t.get('model')}")
         txt.config(text="\n".join(info))
 
@@ -1504,13 +1577,17 @@ class App(tk.Tk):
             if ak:
                 c["ai_tools"][key]["api_key"] = ak
                 c["ai_tools"][key]["enabled"] = True
+            check = validate_config(c)
+            if not check["ok"]:
+                messagebox.showerror("配置校验失败", "\n".join(check["errors"]), parent=win)
+                return
             save_config(c)
             proc.ensure_knowledge_base()
             messagebox.showinfo("成功", "系统配置已保存，知识库目录已初始化。", parent=win)
 
         tk.Button(win, text="保存配置", font=FONT, command=_save,
                   bg=COLORS["navy"], fg="#fff", relief="flat", pady=8).pack(pady=10)
-        tk.Label(win, text="API Key 存本地 config.json，请妥善保管。", font=("Microsoft YaHei", 10),
+        tk.Label(win, text="API Key 可通过 WESTGAS_DEEPSEEK_API_KEY / WESTGAS_DOUBAO_API_KEY 环境变量提供，避免写入配置文件。", font=("Microsoft YaHei", 10),
                  bg=COLORS["bg"], fg="#888").pack()
 
         tk.Label(win, text="知识库周期治理", font=("Microsoft YaHei", 13, "bold"),

@@ -14,6 +14,7 @@ import sys
 
 from ai_tools import (
     get_kb_path, process_by_tool, DOMAIN_LABELS, ATTR_LABELS, classification_label,
+    PROMPT_VERSION, RULE_VERSION,
 )
 
 # Keep this list as the single source of truth for files that can be both
@@ -212,6 +213,29 @@ def clean_text(text):
         out.append(ln)
         previous = ln
     return "\n".join(out)
+
+
+def assess_ocr_quality(text, extraction_method):
+    """给审核人员一个可解释的提取质量提示，不把提示当成审核结论。"""
+    value = str(text or "")
+    replacement = value.count("�")
+    chinese = len(re.findall(r"[\u4e00-\u9fff]", value))
+    warnings = []
+    if not value.strip():
+        warnings.append("未提取到文字")
+    if "OCR" in str(extraction_method) and len(value.strip()) < 80:
+        warnings.append("OCR文字较少，建议对照原图复核")
+    if replacement:
+        warnings.append(f"发现 {replacement} 个无法识别字符")
+    if len(value.strip()) and chinese / max(len(value.strip()), 1) < 0.08 and "OCR" in str(extraction_method):
+        warnings.append("中文识别比例偏低，建议复核")
+    return {
+        "method": extraction_method,
+        "characters": len(value),
+        "chinese_characters": chinese,
+        "warning": "；".join(warnings) if warnings else "",
+        "level": "需复核" if warnings else "正常",
+    }
 
 
 def _record_id(src_file, text):
@@ -474,6 +498,7 @@ def prepare_file(file_path, tool_key=None):
     if ext not in SUPPORTED:
         raise ValueError(f"处理模块暂不支持 {ext}（支持 {sorted(SUPPORTED)}）")
     raw, extraction_method = extract_text_with_method(file_path)
+    ocr_quality = assess_ocr_quality(raw, extraction_method)
     if not raw or not raw.strip():
         return {
             "ok": False,
@@ -482,10 +507,13 @@ def prepare_file(file_path, tool_key=None):
                 "请在系统语言设置中安装中文（简体）OCR后重试。"
             ),
             "extraction_method": extraction_method,
+            "ocr_quality": ocr_quality,
         }
     cleaned = clean_text(raw)
     trace = {
         "requested_tool": tool_key or "rule", "actual_tool": "", "fallback": False, "tasks": {},
+        "prompt_version": PROMPT_VERSION, "rule_version": RULE_VERSION,
+        "extraction_method": extraction_method, "ocr_quality": ocr_quality,
     }
     tag = _run_with_fallback(cleaned, "tag", tool_key or "rule", trace)
     raw_out = write_raw_processed(file_path, cleaned, tag)
@@ -524,6 +552,7 @@ def prepare_file(file_path, tool_key=None):
         "tag": tag,
         "raw_file": raw_out,
         "extraction_method": extraction_method,
+        "ocr_quality": ocr_quality,
         "analysis": analysis,
         "findings": findings,
         # Keep both versions available to the reviewer.  The raw extraction
@@ -605,6 +634,39 @@ def process_files(paths, tool_key=None):
         except Exception as exc:
             results.append((fname, {"ok": False, "msg": str(exc)}))
     return results
+
+
+def process_files_managed(paths, tool_key=None, manager=None, progress=None, task=None):
+    """带统一任务编号、进度、暂停/取消和恢复能力的批量处理入口。"""
+    import task_manager as task_mod
+    manager = manager or task_mod.TaskManager(get_kb_path())
+    names = [os.path.basename(path) for path in paths]
+    task = task or manager.create("资料批量处理", names, {"tool": tool_key or "rule"})
+    raw_results = task_mod.process_with_manager(
+        manager, task["task_id"], list(paths),
+        lambda path: process_file(path, tool_key),
+        progress=progress,
+    )
+    results = []
+    for index, (name, value) in enumerate(zip(names, raw_results)):
+        if isinstance(value, Exception):
+            results.append((name, {"ok": False, "msg": str(value)}))
+        else:
+            results.append((name, value))
+    return task["task_id"], results, manager.get(task["task_id"])
+
+
+def resume_managed_task(task_id, paths, tool_key=None, manager=None, progress=None):
+    """从任务状态文件恢复未完成的批量任务。"""
+    import task_manager as task_mod
+    manager = manager or task_mod.TaskManager(get_kb_path())
+    task = manager.get(task_id)
+    if not task:
+        raise KeyError(task_id)
+    if task.get("status") == "cancelled":
+        raise ValueError("已取消的任务不能直接恢复，请先创建重试任务")
+    manager.resume(task_id)
+    return process_files_managed(paths, tool_key, manager, progress, task)
 
 
 def automate_files(paths, tool_key=None):

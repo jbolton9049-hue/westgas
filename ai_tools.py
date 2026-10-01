@@ -8,6 +8,7 @@ import urllib.error
 import datetime
 import sys
 import hashlib
+import time
 
 APP_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
@@ -42,8 +43,15 @@ def load_config():
 
 
 def save_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+    check = validate_config(cfg)
+    if not check["ok"]:
+        raise ValueError("配置校验失败：" + "；".join(check["errors"]))
+    temporary = CONFIG_PATH + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary, CONFIG_PATH)
 
 
 def get_kb_path():
@@ -59,7 +67,7 @@ def list_available_tools():
     cfg = load_config()
     tools = []
     for key, t in cfg["ai_tools"].items():
-        if t.get("enabled") and t.get("api_key"):
+        if t.get("enabled") and get_api_key(key, t):
             tools.append((key, t["name"]))
     tools.append(("rule", "规则版(本地，无需Key)"))
     return tools
@@ -134,6 +142,61 @@ ATTR_LABELS = {
     "P3": "职能消极行为或失职",
     "P4": "公司消极现象或形式主义",
 }
+
+PROMPT_VERSION = "prompt-1.1"
+RULE_VERSION = "rule-1.1"
+
+
+def validate_config(cfg):
+    """Validate user configuration without exposing API secrets."""
+    errors = []
+    if not isinstance(cfg, dict):
+        return {"ok": False, "errors": ["配置必须是对象"]}
+    if not str(cfg.get("knowledge_base", "")).strip():
+        errors.append("knowledge_base 不能为空")
+    if cfg.get("default_tool", "rule") != "rule" and cfg.get("default_tool") not in DEFAULT_AI_TOOLS:
+        errors.append("default_tool 不是已知工具")
+    if not isinstance(cfg.get("ai_tools", {}), dict):
+        errors.append("ai_tools 必须是对象")
+    for key, value in (cfg.get("ai_tools") or {}).items():
+        if not isinstance(value, dict):
+            errors.append(f"{key} 配置必须是对象")
+            continue
+        if value.get("enabled") and not (value.get("api_key") or os.environ.get(f"WESTGAS_{key.upper()}_API_KEY")):
+            errors.append(f"{key} 已启用但未配置 API Key")
+        if value.get("base_url") and not str(value["base_url"]).startswith(("http://", "https://")):
+            errors.append(f"{key} base_url 必须使用 http 或 https")
+    return {"ok": not errors, "errors": errors}
+
+
+def get_api_key(tool_key, tool):
+    """Prefer OS environment secrets so API keys need not be stored in config.json."""
+    return os.environ.get(f"WESTGAS_{str(tool_key).upper()}_API_KEY") or str(tool.get("api_key", ""))
+
+
+def mask_secret(value):
+    value = str(value or "")
+    return (value[:3] + "***" + value[-3:]) if len(value) > 8 else ("***" if value else "")
+
+
+def _append_ai_audit(tool_key, task, status, elapsed_ms=0, error=""):
+    try:
+        root = get_kb_path()
+        path = os.path.join(root, "00_系统说明", "AI调用日志.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        record = {
+            "time": datetime.datetime.now().isoformat(timespec="seconds"),
+            "tool": "规则版" if tool_key == "rule" else tool_key,
+            "task": task, "status": status, "elapsed_ms": int(elapsed_ms),
+            "prompt_version": PROMPT_VERSION, "rule_version": RULE_VERSION,
+            "version": RULE_VERSION if tool_key == "rule" else PROMPT_VERSION,
+        }
+        if error:
+            record["error"] = str(error)[:500]
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def classification_label(code, labels):
@@ -225,6 +288,33 @@ def record_rule_feedback(text, source, suggested_tag, reviewed_domain, reviewed_
     return path
 
 
+def rule_improvement_report():
+    """汇总人工修正，作为下一版关键词规则的可审计输入。"""
+    counts = {}
+    total = 0
+    path = _rule_feedback_path()
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                total += 1
+                key = (item.get("suggested_domain"), item.get("suggested_attr"),
+                       item.get("reviewed_domain"), item.get("reviewed_attr"))
+                counts[key] = counts.get(key, 0) + 1
+    return {
+        "rule_version": RULE_VERSION, "feedback_count": total,
+        "corrections": [
+            {"suggested_domain": key[0], "suggested_attr": key[1],
+             "reviewed_domain": key[2], "reviewed_attr": key[3], "count": count}
+            for key, count in sorted(counts.items(), key=lambda item: -item[1])
+        ],
+        "recommendation": "优先复核出现次数最多的人工修正，再更新关键词规则；系统不会未经批准自动改变全局规则。",
+    }
+
+
 # ---------- AI 版打标 ----------
 def _parse_tag_json(out):
     """从 AI 返回内容中解析出 domain/attr。兼容带代码块或文字夹杂的 JSON。"""
@@ -260,7 +350,7 @@ def ai_tag(tool_key, text):
         "只输出JSON格式：{\"domain\":\"代码\",\"attr\":\"代码\",\"reason\":\"一句话理由\"}\n\n"
         "资料内容：\n" + text[:3000]
     )
-    out = call_llm(t["base_url"], t["api_key"], t["model"],
+    out = call_llm(t["base_url"], get_api_key(tool_key, t), t["model"],
                    [{"role": "user", "content": prompt}], temperature=0.2)
     parsed = _parse_tag_json(out)
     return {"tool": t["name"], "domain": parsed.get("domain"),
@@ -278,7 +368,7 @@ def ai_extract(tool_key, text):
         "3. 缺失的管理机制（从制度/组织/流程/考核/文化中选择）\n"
         "4. 一句话管理内涵（站在总经理视角，通俗有力）\n\n资料内容：\n" + text[:3000]
     )
-    out = call_llm(t["base_url"], t["api_key"], t["model"],
+    out = call_llm(t["base_url"], get_api_key(tool_key, t), t["model"],
                    [{"role": "user", "content": prompt}])
     return {"tool": t["name"], "content": out}
 
@@ -297,7 +387,7 @@ def ai_analyze(tool_key, text):
         f"<source>\n{text[:12000]}\n</source>"
     )
     out = call_llm(
-        t["base_url"], t["api_key"], t["model"],
+        t["base_url"], get_api_key(tool_key, t), t["model"],
         [{"role": "user", "content": prompt}], temperature=0.2, max_tokens=1800,
     )
     try:
@@ -390,7 +480,7 @@ def ai_extract_findings(tool_key, text):
         "\"reason\":\"判断理由\"}]}\n\n"
         "<source>\n" + text[:16000] + "\n</source>"
     )
-    out = call_llm(t["base_url"], t["api_key"], t["model"],
+    out = call_llm(t["base_url"], get_api_key(tool_key, t), t["model"],
                    [{"role": "user", "content": prompt}], temperature=0.2, max_tokens=2400)
     result = {"tool": t["name"], "findings": _parse_findings_json(out), "raw": out}
     if not _findings_json_valid(out):
@@ -522,24 +612,34 @@ def process_by_tool(text, task="tag", tool_key=None):
     """按指定工具处理。tool_key=None 时用默认。"""
     if tool_key is None:
         tool_key = load_config().get("default_tool", "rule")
-    if tool_key == "rule":
-        if task == "tag":
-            return rule_tag(text)
-        if task == "findings":
-            return rule_findings(text)
-        if task in {"extract", "analyze", "event"}:
-            return rule_analyze(text)
-        return {"tool": "规则版", "content": "规则版暂不支持深度提炼，请配置 AI API 或人工提炼。"}
-    cfg = load_config()
-    if tool_key not in cfg.get("ai_tools", {}):
-        raise ValueError(f"未知AI工具: {tool_key}")
-    tool = cfg["ai_tools"][tool_key]
-    if not tool.get("enabled") or not tool.get("api_key"):
-        raise ValueError(f"AI工具未启用或未配置API Key: {tool.get('name', tool_key)}")
-    if task == "tag":
-        return ai_tag(tool_key, text)
-    if task == "findings":
-        return ai_extract_findings(tool_key, text)
-    if task in {"analyze", "event"}:
-        return ai_analyze(tool_key, text)
-    return ai_extract(tool_key, text)
+    started = time.perf_counter()
+    try:
+        if tool_key == "rule":
+            if task == "tag":
+                result = rule_tag(text)
+            elif task == "findings":
+                result = rule_findings(text)
+            elif task in {"extract", "analyze", "event"}:
+                result = rule_analyze(text)
+            else:
+                result = {"tool": "规则版", "content": "规则版暂不支持深度提炼，请配置 AI API 或人工提炼。"}
+        else:
+            cfg = load_config()
+            if tool_key not in cfg.get("ai_tools", {}):
+                raise ValueError(f"未知AI工具: {tool_key}")
+            tool = cfg["ai_tools"][tool_key]
+            if not tool.get("enabled") or not get_api_key(tool_key, tool):
+                raise ValueError(f"AI工具未启用或未配置API Key: {tool.get('name', tool_key)}")
+            if task == "tag":
+                result = ai_tag(tool_key, text)
+            elif task == "findings":
+                result = ai_extract_findings(tool_key, text)
+            elif task in {"analyze", "event"}:
+                result = ai_analyze(tool_key, text)
+            else:
+                result = ai_extract(tool_key, text)
+        _append_ai_audit(tool_key, task, "success", (time.perf_counter() - started) * 1000)
+        return result
+    except Exception as exc:
+        _append_ai_audit(tool_key, task, "failed", (time.perf_counter() - started) * 1000, exc)
+        raise
